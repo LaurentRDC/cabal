@@ -20,12 +20,17 @@ import Distribution.Client.Types hiding
   )
 
 import Distribution.InstalledPackageInfo (InstalledPackageInfo)
+import Distribution.Simple.Compiler (PackageDBX (..))
+import qualified Distribution.Types.LocalBuildConfig as LBC
 import Distribution.Simple.LocalBuildInfo
   ( ComponentName (..)
   )
 import Distribution.Simple.Utils (removeFileForcibly)
 
+import qualified Data.Map as Map
 import qualified Data.Set as Set
+
+import System.FilePath (makeRelative, normalise)
 
 -----------------------------
 -- Package change detection
@@ -60,13 +65,17 @@ newPackageFileMonitor
   -> PackageFileMonitor
 newPackageFileMonitor
   shared
-  DistDirLayout{distPackageCacheFile}
+  DistDirLayout{distPackageCacheFile, distProjectRootDirectory, distDirectory}
   dparams =
     PackageFileMonitor
       { pkgFileMonitorConfig =
           FileMonitor
             { fileMonitorCacheFile = distPackageCacheFile dparams "config"
-            , fileMonitorKeyValid = (==) `on` normaliseConfiguredPackage shared
+            , -- #12137: The config monitor key is compared after relativising
+              -- project-local paths, so that relocating the whole tree
+              -- does not spuriously invalidate it.
+              fileMonitorKeyValid =
+                (==) `on` (relativiseElabConfigPaths [distDirectory, distProjectRootDirectory] . normaliseConfiguredPackage shared)
             , fileMonitorCheckIfOnlyValueChanged = False
             }
       , pkgFileMonitorBuild =
@@ -79,6 +88,47 @@ newPackageFileMonitor
       , pkgFileMonitorReg =
           newFileMonitor (distPackageCacheFile dparams "registration")
       }
+
+-- | Rewrite the absolute paths in an 'ElaboratedConfiguredPackage' that live
+-- under the project root so that they become relative to it. This makes the
+-- package-configuration file monitor /key/ location-independent, so that
+-- copying the whole tree (sources + dist tree) to a new directory does not
+-- spuriously report \"configuration changed\" and force a reconfigure+rebuild.
+relativiseElabConfigPaths :: [FilePath] -> ElaboratedConfiguredPackage -> ElaboratedConfiguredPackage
+relativiseElabConfigPaths roots elab =
+  elab
+    { elabPkgSourceLocation = relLocation (elabPkgSourceLocation elab)
+    , elabPackageDbs = map (fmap relDB) (elabPackageDbs elab)
+    , elabSetupPackageDBStack = map relDB (elabSetupPackageDBStack elab)
+    , elabBuildPackageDBStack = map relDB (elabBuildPackageDBStack elab)
+    , elabRegisterPackageDBStack = map relDB (elabRegisterPackageDBStack elab)
+    , elabInplaceSetupPackageDBStack = map relDB (elabInplaceSetupPackageDBStack elab)
+    , elabInplaceBuildPackageDBStack = map relDB (elabInplaceBuildPackageDBStack elab)
+    , elabInplaceRegisterPackageDBStack = map relDB (elabInplaceRegisterPackageDBStack elab)
+    , elabInstallDirs = fmap rel (elabInstallDirs elab)
+    , elabExtraLibDirs = map rel (elabExtraLibDirs elab)
+    , elabExtraLibDirsStatic = map rel (elabExtraLibDirsStatic elab)
+    , elabExtraFrameworkDirs = map rel (elabExtraFrameworkDirs elab)
+    , elabExtraIncludeDirs = map rel (elabExtraIncludeDirs elab)
+    , elabProgramPaths = Map.map rel (elabProgramPaths elab)
+    , elabProgramPathExtra = map rel (elabProgramPathExtra elab)
+    , elabHaddockCss = fmap rel (elabHaddockCss elab)
+    , elabHaddockHscolourCss = fmap rel (elabHaddockHscolourCss elab)
+    , elabHaddockOutputDir = fmap rel (elabHaddockOutputDir elab)
+    , elabTestWrapper = fmap rel (elabTestWrapper elab)
+    }
+  where
+    rel :: FilePath -> FilePath
+    rel p = foldl (\acc root -> makeRelative (normalise root) (normalise acc)) p roots
+
+    relDB :: PackageDBX FilePath -> PackageDBX FilePath
+    relDB (SpecificPackageDB fp) = SpecificPackageDB (rel fp)
+    relDB db = db
+
+    relLocation :: PackageLocation (Maybe FilePath) -> PackageLocation (Maybe FilePath)
+    relLocation (LocalUnpackedPackage fp) = LocalUnpackedPackage (rel fp)
+    relLocation (LocalTarballPackage fp) = LocalTarballPackage (rel fp)
+    relLocation loc = loc
 
 -- | Helper function for 'checkPackageFileMonitorChanged',
 -- 'updatePackageConfigFileMonitor' and 'updatePackageBuildFileMonitor'.
@@ -119,6 +169,7 @@ packageFileMonitorKeyValues elab =
         , elabTestKeepTix = False
         , elabTestTestOptions = []
         , elabBenchmarkOptions = []
+        , elabBuildOptions = (elabBuildOptions elab){LBC.relocatable = False}
         }
 
     -- The second part is the value used to guard the build step. So this is
@@ -209,11 +260,15 @@ checkPackageFileMonitorChanged
       changedToMaybe (MonitorUnchanged x _) = Just x
 
 updatePackageConfigFileMonitor
-  :: PackageFileMonitor
+  :: [FilePath]
+  -- ^ The roots that project-local paths may live under (the dist directory and
+  -- the project root).
+  -> PackageFileMonitor
   -> FilePath
   -> ElaboratedConfiguredPackage
   -> IO ()
 updatePackageConfigFileMonitor
+  roots
   PackageFileMonitor{pkgFileMonitorConfig}
   srcdir
   pkg =
@@ -222,7 +277,7 @@ updatePackageConfigFileMonitor
       srcdir
       Nothing
       []
-      pkgconfig
+      (relativiseElabConfigPaths roots pkgconfig)
       ()
     where
       (pkgconfig, _buildComponents) = packageFileMonitorKeyValues pkg
